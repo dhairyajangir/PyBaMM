@@ -1,0 +1,133 @@
+name: Exact-head PyBaMM 6037 readiness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-pybamm-6037-readiness
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'dhairyajangir/PyBaMM'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXPECTED_HEAD: 0e3a1336cb64e7359546898cd1a4a31b860bbe38
+      EXPECTED_TREE: 465708dc14c573e7d7d44330d94c761d2e0d7c2f
+      PYBAMM_DISABLE_TELEMETRY: 'true'
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: '1'
+      MPLBACKEND: Agg
+      VTK_DEFAULT_OPENGL_WINDOW: vtkOSOpenGLRenderWindow
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+    steps:
+      - name: Check out exact PR source and pinned native submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dhairyajangir/PyBaMM
+          ref: 0e3a1336cb64e7359546898cd1a4a31b860bbe38
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Assert source identity
+        run: |
+          export RECEIPTS="$RUNNER_TEMP/pybamm6037-readiness"
+          export PYBAMM_SOLVER_WHEELS="$RUNNER_TEMP/pybamm6037-solver-wheels"
+          printf 'RECEIPTS=%s\nPYBAMM_SOLVER_WHEELS=%s\n' "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS" >> "$GITHUB_ENV"
+          mkdir -p "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          git diff --exit-code HEAD --
+          git rev-parse HEAD 'HEAD^{tree}' HEAD:packages/pybammsolvers > "$RECEIPTS/source-identity.txt"
+          git submodule status --recursive | tee "$RECEIPTS/submodules.txt"
+          if grep -qE '^[-+U]' "$RECEIPTS/submodules.txt"; then exit 1; fi
+          date -u +%FT%TZ > "$RECEIPTS/started-at.txt"
+
+      - name: Set up supported Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.4'
+          enable-cache: false
+
+      - name: Install maintained Linux build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran gcc g++ make cmake libopenblas-dev graphviz pandoc libosmesa6 libegl1
+          sudo apt-get install -y --no-install-recommends texlive-latex-extra dvipng
+          sudo dot -c
+
+      - name: Check lock and seed the locked build environment
+        run: |
+          uv --version | tee "$RECEIPTS/uv-version.txt"
+          uv lock --check 2>&1 | tee "$RECEIPTS/lock-check.log"
+          uv sync --frozen --python 3.13 --extra all --extra jax --group dev --group docs --no-install-package pybammsolvers 2>&1 | tee "$RECEIPTS/build-environment.log"
+          uv run --no-sync --offline python --version | tee "$RECEIPTS/python-version.txt"
+
+      - name: Build this checkout's solver wheel
+        id: build
+        run: |
+          uv build --package pybammsolvers --python 3.13 --wheel --no-build-isolation --out-dir "$PYBAMM_SOLVER_WHEELS" 2>&1 | tee "$RECEIPTS/solver-build.log"
+          test "$(find "$PYBAMM_SOLVER_WHEELS" -maxdepth 1 -name '*-cp313-*.whl' | wc -l)" -eq 1
+          sha256sum "$PYBAMM_SOLVER_WHEELS"/*.whl > "$RECEIPTS/solver-wheel.sha256"
+          find packages/pybammsolvers/build -name CMakeCache.txt -print0 | xargs -0 grep -F "CMAKE_HOME_DIRECTORY:INTERNAL=$GITHUB_WORKSPACE/packages/pybammsolvers" > "$RECEIPTS/native-cmake-source.txt"
+
+      - name: Run the actual full combined nox tests session
+        id: tests
+        env:
+          PYTEST_ADDOPTS: -n 1 -q -o log_cli=false --junitxml=${{ runner.temp }}/pybamm6037-readiness/tests.xml
+        run: |
+          set +e
+          uv run --no-sync --offline nox -s tests 2>&1 | tee "$RECEIPTS/tests.log"
+          pybamm_test_status=${PIPESTATUS[0]}
+          printf '%s\n' "$pybamm_test_status" > "$RECEIPTS/tests.exit"
+          date -u +%FT%TZ > "$RECEIPTS/tests-finished-at.txt"
+          exit "$pybamm_test_status"
+
+      - name: Run the actual nox doctests session after ordinary test failure
+        id: doctests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: -n 1 -q -o log_cli=false --junitxml=${{ runner.temp }}/pybamm6037-readiness/doctests.xml
+        run: |
+          set +e
+          uv run --no-sync --offline nox -s doctests 2>&1 | tee "$RECEIPTS/doctests.log"
+          pybamm_doctest_status=${PIPESTATUS[0]}
+          printf '%s\n' "$pybamm_doctest_status" > "$RECEIPTS/doctests.exit"
+          date -u +%FT%TZ > "$RECEIPTS/doctests-finished-at.txt"
+          exit "$pybamm_doctest_status"
+
+      - name: Record both session environments and final source identity
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          for pybamm_session in tests doctests; do
+            test -x ".nox/$pybamm_session/bin/python"
+            uv pip list --python ".nox/$pybamm_session/bin/python" --format json > "$RECEIPTS/$pybamm_session-packages.json"
+          done
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          git diff --exit-code HEAD --
+          date -u +%FT%TZ > "$RECEIPTS/finished-at.txt"
+
+      - name: Upload exact-head verification receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pybamm-6037-0e3a1336-readiness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pybamm6037-readiness/
+          if-no-files-found: error
+          retention-days: 14
