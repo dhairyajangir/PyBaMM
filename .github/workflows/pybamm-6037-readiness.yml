@@ -1,4 +1,4 @@
-name: Exact-head PyBaMM 6037 readiness
+name: Exact-source PyBaMM 6037 main8ec paired readiness
 
 on:
   workflow_dispatch:
@@ -7,20 +7,38 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-pybamm-6037-readiness
+  group: fork-pybamm-6037-main8ec-paired-readiness
   cancel-in-progress: false
 
 jobs:
   verify:
     if: github.repository == 'dhairyajangir/PyBaMM'
+    name: ${{ matrix.profile }} fresh-native full gates
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - profile: baseline-8ecfc4a3
+            repository: pybamm-team/PyBaMM
+            head: 8ecfc4a372a0dc9f2257359abaa40aa89cfb30b4
+            tree: b4092ebf5d8b038aad18dc2150e42b6e53f1f511
+          - profile: candidate-5033a965
+            repository: dhairyajangir/PyBaMM
+            head: 5033a965d1f420288e0ffe94b59eea36fda6a61d
+            tree: eda313c287256c3a1a1e37f3f848232324257e5f
     runs-on: ubuntu-latest
     timeout-minutes: 360
     defaults:
       run:
         shell: bash
     env:
-      EXPECTED_HEAD: 1032958de4fcfb4974422fa9266004e7e3cdf675
-      EXPECTED_TREE: 944086fd78bcdd2bf8e6946d9ff770e269450932
+      PROFILE: ${{ matrix.profile }}
+      HELPER_WORKFLOW_REF: ${{ github.workflow_ref }}
+      HELPER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      EXPECTED_HEAD: ${{ matrix.head }}
+      EXPECTED_TREE: ${{ matrix.tree }}
+      EXPECTED_NATIVE_TREE: 92e5498bd93d0942626429033ef00149d6b25f7d
       PYBAMM_DISABLE_TELEMETRY: 'true'
       PYTHONIOENCODING: utf-8
       PYTHONUNBUFFERED: '1'
@@ -28,25 +46,30 @@ jobs:
       VTK_DEFAULT_OPENGL_WINDOW: vtkOSOpenGLRenderWindow
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
     steps:
-      - name: Check out exact PR source and pinned native submodules
+      - name: Check out exact profile source and pinned native submodules
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: dhairyajangir/PyBaMM
-          ref: 1032958de4fcfb4974422fa9266004e7e3cdf675
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.head }}
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
 
       - name: Assert source identity
         run: |
-          export RECEIPTS="$RUNNER_TEMP/pybamm6037-readiness"
-          export PYBAMM_SOLVER_WHEELS="$RUNNER_TEMP/pybamm6037-solver-wheels"
-          export PRE_COMMIT_HOME="$RUNNER_TEMP/pybamm6037-pre-commit-cache"
+          export RECEIPTS="$RUNNER_TEMP/pybamm6037-main8ec-$PROFILE-readiness"
+          export PYBAMM_SOLVER_WHEELS="$RUNNER_TEMP/pybamm6037-main8ec-$PROFILE-solver-wheels"
+          export PRE_COMMIT_HOME="$RUNNER_TEMP/pybamm6037-main8ec-$PROFILE-pre-commit-cache"
           printf 'RECEIPTS=%s\nPYBAMM_SOLVER_WHEELS=%s\nPRE_COMMIT_HOME=%s\n' "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS" "$PRE_COMMIT_HOME" >> "$GITHUB_ENV"
           mkdir -p "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS" "$PRE_COMMIT_HOME"
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test "$(git rev-parse HEAD:packages/pybammsolvers)" = "$EXPECTED_NATIVE_TREE"
           git diff --exit-code HEAD --
+          git ls-tree -r HEAD packages/pybammsolvers > "$RECEIPTS/native-source-manifest.txt"
+          printf '%s\n' "$HELPER_WORKFLOW_REF" "$HELPER_WORKFLOW_SHA" > "$RECEIPTS/helper-workflow-identity.txt"
+          uname -a > "$RECEIPTS/runner-kernel.txt"
+          printf '%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RECEIPTS/runner-image.txt"
           git rev-parse HEAD 'HEAD^{tree}' HEAD:packages/pybammsolvers > "$RECEIPTS/source-identity.txt"
           git submodule status --recursive | tee "$RECEIPTS/submodules.txt"
           if grep -qE '^[-+U]' "$RECEIPTS/submodules.txt"; then exit 1; fi
@@ -55,7 +78,7 @@ jobs:
       - name: Set up supported Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.13'
+          python-version: '3.13.18'
 
       - name: Set up uv
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
@@ -74,22 +97,68 @@ jobs:
         run: |
           uv --version | tee "$RECEIPTS/uv-version.txt"
           uv lock --check 2>&1 | tee "$RECEIPTS/lock-check.log"
-          uv sync --frozen --python 3.13 --extra all --extra jax --group dev --group docs --no-install-package pybammsolvers 2>&1 | tee "$RECEIPTS/build-environment.log"
+          uv sync --frozen --python 3.13.18 --extra all --extra jax --group dev --group docs --no-install-package pybammsolvers 2>&1 | tee "$RECEIPTS/build-environment.log"
           uv run --no-sync --offline python --version | tee "$RECEIPTS/python-version.txt"
 
       - name: Build this checkout's solver wheel
         id: build
         run: |
-          uv build --package pybammsolvers --python 3.13 --wheel --no-build-isolation --out-dir "$PYBAMM_SOLVER_WHEELS" 2>&1 | tee "$RECEIPTS/solver-build.log"
+          uv build --package pybammsolvers --python 3.13.18 --wheel --no-build-isolation --out-dir "$PYBAMM_SOLVER_WHEELS" 2>&1 | tee "$RECEIPTS/solver-build.log"
           test "$(find "$PYBAMM_SOLVER_WHEELS" -maxdepth 1 -name '*-cp313-*.whl' | wc -l)" -eq 1
           sha256sum "$PYBAMM_SOLVER_WHEELS"/*.whl > "$RECEIPTS/solver-wheel.sha256"
           find packages/pybammsolvers/build -name CMakeCache.txt -print0 | xargs -0 grep -F "CMAKE_HOME_DIRECTORY:INTERNAL=$GITHUB_WORKSPACE/packages/pybammsolvers" > "$RECEIPTS/native-cmake-source.txt"
+
+      - name: Verify fresh native import and run the complete native package suite
+        id: native_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          pybamm_wheels=("$PYBAMM_SOLVER_WHEELS"/*-cp313-*.whl)
+          test "${#pybamm_wheels[@]}" -eq 1
+          uv pip install --python "$GITHUB_WORKSPACE/.venv/bin/python" --no-deps --force-reinstall "${pybamm_wheels[0]}" 2>&1 | tee "$RECEIPTS/native-install.log"
+          uv run --no-sync --offline python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import zipfile
+          from pybammsolvers import idaklu
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          expected_env = workspace / ".venv"
+          assert Path(sys.prefix).resolve() == expected_env
+          assert sys.version_info[:3] == (3, 13, 18)
+          native = Path(idaklu.__file__).resolve()
+          assert native.is_relative_to(expected_env)
+          wheels = list(Path(os.environ["PYBAMM_SOLVER_WHEELS"]).glob("*-cp313-*.whl"))
+          assert len(wheels) == 1
+          sha = lambda data: hashlib.sha256(data).hexdigest()
+          with zipfile.ZipFile(wheels[0]) as archive:
+              members = [name for name in archive.namelist()
+                         if name.startswith("pybammsolvers/") and name.endswith("/" + native.name)]
+              assert len(members) == 1
+              member_sha = sha(archive.read(members[0]))
+          assert sha(native.read_bytes()) == member_sha
+          record = {"profile": os.environ["PROFILE"], "python": sys.version,
+                    "executable": sys.executable, "prefix": sys.prefix,
+                    "native": str(native), "native_sha256": member_sha,
+                    "wheel": str(wheels[0]), "wheel_sha256": sha(wheels[0].read_bytes()),
+                    "archive_member": members[0], "installed_bytes_match_fresh_wheel": True}
+          (Path(os.environ["RECEIPTS"]) / "native-suite-runtime.json").write_text(json.dumps(record, indent=2) + "\n")
+          print(json.dumps(record, indent=2))
+          PY
+          set +e
+          uv run --no-sync --offline python -m pytest packages/pybammsolvers/tests --junitxml="$RECEIPTS/native-tests.xml" 2>&1 | tee "$RECEIPTS/native-tests.log"
+          pybamm_pipeline_status=("${PIPESTATUS[@]}")
+          printf '%s\n' "${pybamm_pipeline_status[0]}" > "$RECEIPTS/native-tests.exit"
+          printf '%s\n' "${pybamm_pipeline_status[1]}" > "$RECEIPTS/native-tests-log.exit"
+          if test "${pybamm_pipeline_status[0]}" -ne 0; then exit "${pybamm_pipeline_status[0]}"; fi
+          exit "${pybamm_pipeline_status[1]}"
 
       - name: Run the actual full combined nox tests session
         id: tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
-          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/pybamm6037-readiness/tests.xml
+          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/pybamm6037-main8ec-${{ matrix.profile }}-readiness/tests.xml
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
@@ -109,7 +178,7 @@ jobs:
         id: doctests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
-          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/pybamm6037-readiness/doctests.xml
+          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/pybamm6037-main8ec-${{ matrix.profile }}-readiness/doctests.xml
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
@@ -154,25 +223,43 @@ jobs:
           try:
               assert Path(sys.prefix).resolve() == expected_env.resolve()
               assert Path(sys.executable).absolute() == expected_executable.absolute()
-              assert sys.version_info[:2] == (3, 13)
+              assert sys.version_info[:3] == (3, 13, 18)
               head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
               tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
               assert head == os.environ["EXPECTED_HEAD"]
               assert tree == os.environ["EXPECTED_TREE"]
-              record.update(head=head, tree=tree, modules={})
+              native_tree = subprocess.check_output(["git", "rev-parse", "HEAD:packages/pybammsolvers"], text=True).strip()
+              assert native_tree == os.environ["EXPECTED_NATIVE_TREE"]
+              record.update(profile=os.environ["PROFILE"], head=head, tree=tree, native_tree=native_tree, modules={})
               record["versions"] = {name: importlib.metadata.version(name) for name in
                                     ["pybamm", "pybammsolvers", "numpy", "scipy", "casadi",
                                      "pillow", "tornado", "pytest"]}
-              for name in ["pybamm", "pybamm.models.full_battery_models.lithium_ion.electrode_soh",
-                           "pybamm.models.full_battery_models.lithium_ion.electrode_soh_algebraic_solver",
-                           "pybamm.models.full_battery_models.lithium_ion.electrode_soh_half_cell",
-                           "pybamm.models.full_battery_models.lithium_ion.electrode_soh_composite"]:
+              modules = ["pybamm", "pybamm.solvers.idaklu_solver",
+                         "pybamm.models.full_battery_models.lithium_ion.electrode_soh",
+                         "pybamm.models.full_battery_models.lithium_ion.electrode_soh_half_cell",
+                         "pybamm.models.full_battery_models.lithium_ion.electrode_soh_composite"]
+              if os.environ["PROFILE"] == "candidate-5033a965":
+                  modules.append("pybamm.models.full_battery_models.lithium_ion.electrode_soh_algebraic_solver")
+              else:
+                  assert not (workspace / "packages/pybamm/src/pybamm/models/full_battery_models/lithium_ion/electrode_soh_algebraic_solver.py").exists()
+              for name in modules:
                   path = Path(importlib.import_module(name).__file__).resolve()
                   assert path.is_relative_to(workspace / "packages/pybamm/src/pybamm")
                   relative = path.relative_to(workspace).as_posix()
                   committed = subprocess.check_output(["git", "show", "HEAD:" + relative])
                   assert sha(path.read_bytes()) == sha(committed)
                   record["modules"][name] = {"path": str(path), "sha256": sha(committed)}
+              record["shared_sources"] = {}
+              for relative in ["noxfile.py", "uv.lock", "pyproject.toml", ".pre-commit-config.yaml",
+                               "packages/pybamm/pyproject.toml", "packages/pybammsolvers/pyproject.toml",
+                               "packages/pybamm/tests/unit/test_citations.py",
+                               "packages/pybamm/src/pybamm/citations.py",
+                               "packages/pybamm/conftest.py", "packages/pybamm/tests/conftest.py"]:
+                  path = workspace / relative
+                  committed = subprocess.check_output(["git", "show", "HEAD:" + relative])
+                  assert sha(path.read_bytes()) == sha(committed)
+                  blob = subprocess.check_output(["git", "rev-parse", "HEAD:" + relative], text=True).strip()
+                  record["shared_sources"][relative] = {"sha256": sha(committed), "git_blob": blob}
               from pybammsolvers import idaklu
               native = Path(idaklu.__file__).resolve()
               assert native.is_relative_to(expected_env.resolve())
@@ -298,7 +385,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: pybamm-6037-1032958d-readiness-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/pybamm6037-readiness/
+          name: pybamm-6037-main8ec-${{ matrix.profile }}-readiness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pybamm6037-main8ec-${{ matrix.profile }}-readiness/
           if-no-files-found: error
           retention-days: 14
