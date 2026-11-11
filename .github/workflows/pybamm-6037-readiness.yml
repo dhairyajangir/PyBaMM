@@ -19,22 +19,20 @@ jobs:
       run:
         shell: bash
     env:
-      EXPECTED_HEAD: 0e3a1336cb64e7359546898cd1a4a31b860bbe38
-      EXPECTED_TREE: 465708dc14c573e7d7d44330d94c761d2e0d7c2f
+      EXPECTED_HEAD: 1032958de4fcfb4974422fa9266004e7e3cdf675
+      EXPECTED_TREE: 944086fd78bcdd2bf8e6946d9ff770e269450932
       PYBAMM_DISABLE_TELEMETRY: 'true'
       PYTHONIOENCODING: utf-8
       PYTHONUNBUFFERED: '1'
       MPLBACKEND: Agg
       VTK_DEFAULT_OPENGL_WINDOW: vtkOSOpenGLRenderWindow
-      OPENBLAS_NUM_THREADS: '1'
-      OMP_NUM_THREADS: '1'
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
     steps:
       - name: Check out exact PR source and pinned native submodules
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: dhairyajangir/PyBaMM
-          ref: 0e3a1336cb64e7359546898cd1a4a31b860bbe38
+          ref: 1032958de4fcfb4974422fa9266004e7e3cdf675
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
@@ -43,8 +41,9 @@ jobs:
         run: |
           export RECEIPTS="$RUNNER_TEMP/pybamm6037-readiness"
           export PYBAMM_SOLVER_WHEELS="$RUNNER_TEMP/pybamm6037-solver-wheels"
-          printf 'RECEIPTS=%s\nPYBAMM_SOLVER_WHEELS=%s\n' "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS" >> "$GITHUB_ENV"
-          mkdir -p "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS"
+          export PRE_COMMIT_HOME="$RUNNER_TEMP/pybamm6037-pre-commit-cache"
+          printf 'RECEIPTS=%s\nPYBAMM_SOLVER_WHEELS=%s\nPRE_COMMIT_HOME=%s\n' "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS" "$PRE_COMMIT_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$RECEIPTS" "$PYBAMM_SOLVER_WHEELS" "$PRE_COMMIT_HOME"
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
           git diff --exit-code HEAD --
@@ -88,46 +87,218 @@ jobs:
 
       - name: Run the actual full combined nox tests session
         id: tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
-          PYTEST_ADDOPTS: -n 1 -q -o log_cli=false --junitxml=${{ runner.temp }}/pybamm6037-readiness/tests.xml
+          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/pybamm6037-readiness/tests.xml
         run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          git diff --exit-code HEAD --
           set +e
           uv run --no-sync --offline nox -s tests 2>&1 | tee "$RECEIPTS/tests.log"
-          pybamm_test_status=${PIPESTATUS[0]}
+          pybamm_pipeline_status=("${PIPESTATUS[@]}")
+          pybamm_test_status=${pybamm_pipeline_status[0]}
+          pybamm_log_status=${pybamm_pipeline_status[1]}
           printf '%s\n' "$pybamm_test_status" > "$RECEIPTS/tests.exit"
           date -u +%FT%TZ > "$RECEIPTS/tests-finished-at.txt"
-          exit "$pybamm_test_status"
+          printf '%s\n' "$pybamm_log_status" > "$RECEIPTS/tests-log.exit"
+          if test "$pybamm_test_status" -ne 0; then exit "$pybamm_test_status"; fi
+          exit "$pybamm_log_status"
 
       - name: Run the actual nox doctests session after ordinary test failure
         id: doctests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
-          PYTEST_ADDOPTS: -n 1 -q -o log_cli=false --junitxml=${{ runner.temp }}/pybamm6037-readiness/doctests.xml
+          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/pybamm6037-readiness/doctests.xml
         run: |
-          set +e
-          uv run --no-sync --offline nox -s doctests 2>&1 | tee "$RECEIPTS/doctests.log"
-          pybamm_doctest_status=${PIPESTATUS[0]}
-          printf '%s\n' "$pybamm_doctest_status" > "$RECEIPTS/doctests.exit"
-          date -u +%FT%TZ > "$RECEIPTS/doctests-finished-at.txt"
-          exit "$pybamm_doctest_status"
-
-      - name: Record both session environments and final source identity
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          for pybamm_session in tests doctests; do
-            test -x ".nox/$pybamm_session/bin/python"
-            uv pip list --python ".nox/$pybamm_session/bin/python" --format json > "$RECEIPTS/$pybamm_session-packages.json"
-          done
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
           git diff --exit-code HEAD --
+          set +e
+          uv run --no-sync --offline nox -s doctests 2>&1 | tee "$RECEIPTS/doctests.log"
+          pybamm_pipeline_status=("${PIPESTATUS[@]}")
+          pybamm_doctest_status=${pybamm_pipeline_status[0]}
+          pybamm_log_status=${pybamm_pipeline_status[1]}
+          printf '%s\n' "$pybamm_doctest_status" > "$RECEIPTS/doctests.exit"
+          date -u +%FT%TZ > "$RECEIPTS/doctests-finished-at.txt"
+          printf '%s\n' "$pybamm_log_status" > "$RECEIPTS/doctests-log.exit"
+          if test "$pybamm_doctest_status" -ne 0; then exit "$pybamm_doctest_status"; fi
+          exit "$pybamm_log_status"
+
+      - name: Verify session source imports, native wheel bytes and observed workers
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          cat > "$RECEIPTS/verify-runtime.py" <<'PY'
+          import hashlib
+          import importlib
+          import importlib.metadata
+          from email.parser import BytesParser
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import traceback
+          import zipfile
+
+          session = sys.argv[1]
+          receipts = Path(os.environ["RECEIPTS"])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          expected_env = workspace / ".nox" / session
+          expected_executable = expected_env / "bin/python"
+          record = {"session": session, "executable": sys.executable, "prefix": sys.prefix,
+                    "expected_environment": str(expected_env), "expected_executable": str(expected_executable),
+                    "python": sys.version}
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+          try:
+              assert Path(sys.prefix).resolve() == expected_env.resolve()
+              assert Path(sys.executable).absolute() == expected_executable.absolute()
+              assert sys.version_info[:2] == (3, 13)
+              head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+              assert head == os.environ["EXPECTED_HEAD"]
+              assert tree == os.environ["EXPECTED_TREE"]
+              record.update(head=head, tree=tree, modules={})
+              record["versions"] = {name: importlib.metadata.version(name) for name in
+                                    ["pybamm", "pybammsolvers", "numpy", "scipy", "casadi",
+                                     "pillow", "tornado", "pytest"]}
+              for name in ["pybamm", "pybamm.models.full_battery_models.lithium_ion.electrode_soh",
+                           "pybamm.models.full_battery_models.lithium_ion.electrode_soh_algebraic_solver",
+                           "pybamm.models.full_battery_models.lithium_ion.electrode_soh_half_cell",
+                           "pybamm.models.full_battery_models.lithium_ion.electrode_soh_composite"]:
+                  path = Path(importlib.import_module(name).__file__).resolve()
+                  assert path.is_relative_to(workspace / "packages/pybamm/src/pybamm")
+                  relative = path.relative_to(workspace).as_posix()
+                  committed = subprocess.check_output(["git", "show", "HEAD:" + relative])
+                  assert sha(path.read_bytes()) == sha(committed)
+                  record["modules"][name] = {"path": str(path), "sha256": sha(committed)}
+              from pybammsolvers import idaklu
+              native = Path(idaklu.__file__).resolve()
+              assert native.is_relative_to(expected_env.resolve())
+              wheels = list(Path(os.environ["PYBAMM_SOLVER_WHEELS"]).glob("*-cp313-*.whl"))
+              assert len(wheels) == 1
+              wheel = wheels[0]
+              with zipfile.ZipFile(wheel) as archive:
+                  members = [name for name in archive.namelist()
+                             if name.startswith("pybammsolvers/") and name.endswith("/" + native.name)]
+                  assert len(members) == 1
+                  member_sha = sha(archive.read(members[0]))
+                  metadata_members = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+                  assert len(metadata_members) == 1
+                  wheel_metadata = BytesParser().parsebytes(archive.read(metadata_members[0]))
+                  assert wheel_metadata["Name"] == "pybammsolvers"
+                  assert wheel_metadata["Version"] == record["versions"]["pybammsolvers"]
+              native_sha = sha(native.read_bytes())
+              assert native_sha == member_sha
+              record["native"] = {"path": str(native), "sha256": native_sha,
+                                  "wheel": str(wheel), "wheel_sha256": sha(wheel.read_bytes()),
+                                  "archive_member": members[0], "archive_member_sha256": member_sha,
+                                  "wheel_version": wheel_metadata["Version"],
+                                  "installed_bytes_match_fresh_wheel": True}
+              record["passed"] = True
+          except Exception:
+              record["passed"] = False
+              record["error"] = traceback.format_exc()
+          (receipts / (session + "-runtime.json")).write_text(json.dumps(record, indent=2) + "\n")
+          print(json.dumps(record, indent=2))
+          raise SystemExit(0 if record["passed"] else 1)
+          PY
+          set +e
+          pybamm_runtime_status=0
+          for pybamm_session in tests doctests; do
+            pybamm_session_env="$GITHUB_WORKSPACE/.nox/$pybamm_session"
+            UV_PROJECT_ENVIRONMENT="$pybamm_session_env" uv run --no-sync --offline --python "$pybamm_session_env/bin/python" python "$RECEIPTS/verify-runtime.py" "$pybamm_session" 2>&1 | tee "$RECEIPTS/$pybamm_session-runtime.log"
+            pybamm_pipeline_status=("${PIPESTATUS[@]}")
+            printf '%s\n' "${pybamm_pipeline_status[0]}" > "$RECEIPTS/$pybamm_session-runtime.exit"
+            if test "${pybamm_pipeline_status[0]}" -ne 0 || test "${pybamm_pipeline_status[1]}" -ne 0; then
+              pybamm_runtime_status=1
+            fi
+          done
+          uv run --no-sync --offline python - "$RECEIPTS" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+          receipts = Path(sys.argv[1])
+          result = {}
+          for session in ["tests", "doctests"]:
+              path = receipts / (session + ".log")
+              text = path.read_text(errors="replace") if path.exists() else ""
+              text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+              lines = [line for line in text.splitlines()
+                       if re.match(r"^(?:created:\s*)?\d+(?:/\d+)? workers?\b", line)]
+              entries = [{"line": line, "workers": int(re.search(r"\d+", line).group())}
+                         for line in lines]
+              item = {"observed_worker_lines": entries,
+                      "worker_count_observed": bool(entries),
+                      "note": "Log observations only; no worker/config override was applied."}
+              xml = receipts / (session + ".xml")
+              if xml.exists():
+                  try:
+                      root = ET.parse(xml).getroot()
+                      item["junit_suites"] = [node.attrib for node in root.iter("testsuite")]
+                      item["junit_testcase_elements"] = len(list(root.iter("testcase")))
+                  except ET.ParseError as error:
+                      item["junit_parse_error"] = str(error)
+              result[session] = item
+          (receipts / "observed-workers-and-junit.json").write_text(json.dumps(result, indent=2) + "\n")
+          PY
+          pybamm_worker_status=$?
+          printf '%s\n' "$pybamm_worker_status" > "$RECEIPTS/worker-observation.exit"
+          if test "$pybamm_worker_status" -ne 0; then pybamm_runtime_status=1; fi
+          exit "$pybamm_runtime_status"
+
+
+      - name: Run the actual all-files nox pre-commit session after ordinary failures
+        id: precommit
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          git diff --exit-code HEAD --
+          set +e
+          uv run --no-sync --offline nox -s pre-commit 2>&1 | tee "$RECEIPTS/pre-commit.log"
+          pybamm_pipeline_status=("${PIPESTATUS[@]}")
+          pybamm_precommit_status=${pybamm_pipeline_status[0]}
+          pybamm_log_status=${pybamm_pipeline_status[1]}
+          printf '%s\n' "$pybamm_precommit_status" > "$RECEIPTS/pre-commit.exit"
+          printf '%s\n' "$pybamm_log_status" > "$RECEIPTS/pre-commit-log.exit"
+          date -u +%FT%TZ > "$RECEIPTS/pre-commit-finished-at.txt"
+          if test "$pybamm_precommit_status" -ne 0; then exit "$pybamm_precommit_status"; fi
+          exit "$pybamm_log_status"
+
+      - name: Record all session environments and final source identity
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          pybamm_provenance_status=0
+          for pybamm_session in tests doctests pre-commit; do
+            if test -x ".nox/$pybamm_session/bin/python"; then
+              uv pip list --python ".nox/$pybamm_session/bin/python" --format json > "$RECEIPTS/$pybamm_session-packages.json" || pybamm_provenance_status=1
+            else
+              printf 'Session environment missing: %s\n' "$pybamm_session" > "$RECEIPTS/$pybamm_session-environment-missing.txt"
+              pybamm_provenance_status=1
+            fi
+            if ! test -s "$RECEIPTS/$pybamm_session.exit"; then
+              printf 'Terminal exit receipt missing: %s\n' "$pybamm_session" > "$RECEIPTS/$pybamm_session-exit-missing.txt"
+              pybamm_provenance_status=1
+            fi
+          done
+          git rev-parse HEAD 'HEAD^{tree}' HEAD:packages/pybammsolvers > "$RECEIPTS/final-source-identity.txt"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD" || pybamm_provenance_status=1
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE" || pybamm_provenance_status=1
+          git diff --binary HEAD -- > "$RECEIPTS/final-source-diff.patch"
+          git diff --exit-code HEAD -- || pybamm_provenance_status=1
           date -u +%FT%TZ > "$RECEIPTS/finished-at.txt"
+          printf '%s\n' "$pybamm_provenance_status" > "$RECEIPTS/provenance.exit"
+          exit "$pybamm_provenance_status"
 
       - name: Upload exact-head verification receipts
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: pybamm-6037-0e3a1336-readiness-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pybamm-6037-1032958d-readiness-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/pybamm6037-readiness/
           if-no-files-found: error
           retention-days: 14
