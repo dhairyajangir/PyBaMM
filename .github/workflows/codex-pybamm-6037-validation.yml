@@ -20,11 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
       - name: Check out the test tree
         run: |
-          candidate=$(git rev-parse HEAD^)
+          candidate=$(git rev-parse HEAD~2)
           baseline=$(git rev-parse "$candidate^2")
           case "$SOURCE_VARIANT" in
             baseline) git checkout --detach "$baseline" ;;
@@ -39,8 +39,9 @@ jobs:
           enable-cache: false
       - name: Install Linux test dependencies
         run: |
+          sudo sed -i -E '/^URIs:/s@mirror\+file:/etc/apt/apt-mirrors[^ ]*\.txt@https://archive.ubuntu.com/ubuntu@g' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update -o Acquire::Retries=2
-          sudo apt-get install --no-install-recommends -y graphviz pandoc libosmesa6 libegl1
+          sudo apt-get install --no-install-recommends -y graphviz pandoc libosmesa6 libegl1 gfortran libopenblas-dev liblapack-dev
           sudo dot -c
       - name: Run PyBaMM unit and integration tests
         run: |
