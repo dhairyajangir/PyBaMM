@@ -1,0 +1,48 @@
+name: PyBaMM 6037 comparison
+on:
+  push:
+    branches: [codex/validate-pybamm-6037-20261124]
+permissions:
+  contents: read
+jobs:
+  tests:
+    if: github.repository == 'dhairyajangir/PyBaMM'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [baseline, candidate]
+    env:
+      PYBAMM_DISABLE_TELEMETRY: "true"
+      PYTEST_XDIST_AUTO_NUM_WORKERS: "4"
+      SOURCE_VARIANT: ${{ matrix.source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Check out the test tree
+        run: |
+          candidate=$(git rev-parse HEAD^)
+          baseline=$(git rev-parse "$candidate^2")
+          case "$SOURCE_VARIANT" in
+            baseline) git checkout --detach "$baseline" ;;
+            candidate) git checkout --detach "$candidate" ;;
+          esac
+          git log -1 --format='%H %T'
+          git submodule update --init --depth 1
+          test -z "$(git status --porcelain)"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: "latest"
+          enable-cache: false
+      - name: Install Linux test dependencies
+        run: |
+          sudo apt-get update -o Acquire::Retries=2
+          sudo apt-get install --no-install-recommends -y graphviz pandoc libosmesa6 libegl1
+          sudo dot -c
+      - name: Run PyBaMM unit and integration tests
+        run: |
+          cargo --version
+          uv run --no-project --python 3.13 --with nox nox -s tests
